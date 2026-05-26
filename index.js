@@ -2,6 +2,19 @@ const axios = require('axios');
 const TelegramBot = require('node-telegram-bot-api');
 
 require('dotenv').config();
+const express = require('express');
+
+const app = express();
+
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+    res.send('Forex Bot Running...');
+});
+
+app.listen(PORT, () => {
+    console.log(`🌍 Server running on port ${PORT}`);
+});
 
 const CONFIG = {
     API_KEY: process.env.AV_API_KEY,
@@ -25,6 +38,14 @@ const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN);
 // Sleep function to avoid API limits
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/* =========================
+   WEEKEND CHECK (ADDED ONLY)
+========================= */
+function isWeekend() {
+    const day = new Date().getDay();
+    return (day === 0 || day === 6);
 }
 
 // Fetch Forex Daily Data
@@ -163,6 +184,14 @@ Time: ${new Date().toLocaleString()}`
 // Main Bot Runner
 async function runBot() {
 
+    /* =========================
+       WEEKEND STOP (ADDED ONLY)
+    ========================= */
+    if (isWeekend()) {
+        console.log("⏸ Weekend detected — market closed. Bot paused.");
+        return;
+    }
+
     console.log(`\n==============================`);
     console.log(`🚀 Forex Signal Bot Started`);
     console.log(`==============================`);
@@ -184,10 +213,10 @@ async function runBot() {
 
     console.log(`\n✅ Analysis Complete\n`);
 }
+
 process.on('uncaughtException', (err) => {
     console.error('💥 Uncaught Exception:', err);
 
-    // Prevent bot from dying
     console.log('🔁 Restarting bot in 5 seconds...');
     setTimeout(() => {
         runBot();
@@ -199,6 +228,7 @@ process.on('unhandledRejection', (reason) => {
 
     console.log('🔁 Continuing safely...');
 });
+
 async function start() {
     try {
         await runBot();
