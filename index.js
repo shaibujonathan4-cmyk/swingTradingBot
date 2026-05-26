@@ -32,6 +32,11 @@ const CONFIG = {
     TP_PIPS: 100
 };
 
+/* =========================
+   DUPLICATE SIGNAL FILTER
+========================= */
+const sentSignals = {};
+
 // Initialize Telegram Bot
 const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN);
 
@@ -41,7 +46,7 @@ function sleep(ms) {
 }
 
 /* =========================
-   WEEKEND CHECK (ADDED ONLY)
+   WEEKEND CHECK
 ========================= */
 function isWeekend() {
     const day = new Date().getDay();
@@ -157,6 +162,18 @@ async function analyze(candles, pair) {
             TP: tp.toFixed(5)
         });
 
+        /* =========================
+           DUPLICATE CHECK
+        ========================= */
+        const signalKey = `${pair}-${signal}-${today.date}`;
+
+        if (sentSignals[signalKey]) {
+            console.log(`🔁 Duplicate signal skipped for ${pair}`);
+            return;
+        }
+
+        sentSignals[signalKey] = true;
+
         // Send Telegram Alert
         await bot.sendMessage(
             CONFIG.CHAT_ID,
@@ -185,7 +202,7 @@ Time: ${new Date().toLocaleString()}`
 async function runBot() {
 
     /* =========================
-       WEEKEND STOP (ADDED ONLY)
+       WEEKEND STOP
     ========================= */
     if (isWeekend()) {
         console.log("⏸ Weekend detected — market closed. Bot paused.");
