@@ -17,7 +17,7 @@ app.listen(PORT, () => {
 });
 
 const CONFIG = {
-    API_KEY: process.env.AV_API_KEY,
+    API_KEY: process.env.TWELVE_API_KEY,
     CHAT_ID: process.env.CHAT_ID,
     TELEGRAM_TOKEN: process.env.TELEGRAM_TOKEN,
 
@@ -28,14 +28,15 @@ const CONFIG = {
         ["USD", "CHF"]
     ],
 
-    SL_PIPS: 50,
-    TP_PIPS: 100
+    SL_PIPS: 20,
+    TP_PIPS: 60
 };
 
 /* =========================
-   DUPLICATE SIGNAL FILTER
+   SAFETY CONTROLS
 ========================= */
 const sentSignals = {};
+let isRunning = false;
 
 // Initialize Telegram Bot
 const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN);
@@ -53,32 +54,33 @@ function isWeekend() {
     return (day === 0 || day === 6);
 }
 
-// Fetch Forex Daily Data
+// Fetch Forex Data (Twelve Data)
 async function getDailyFX(from, to) {
 
     const url =
-        `https://www.alphavantage.co/query?function=FX_DAILY&from_symbol=${from}&to_symbol=${to}&apikey=${CONFIG.API_KEY}`;
+        `https://api.twelvedata.com/time_series?symbol=${from}/${to}&interval=15min&outputsize=5&apikey=${CONFIG.API_KEY}`;
 
     try {
 
-        const response = await axios.get(url);
+        const response = await axios.get(url, {
+            timeout: 15000
+        });
 
-        const data = response.data["Time Series FX (Daily)"];
+        const data = response.data.values;
 
-        if (!data) {
+        if (!data || response.data.status === "error") {
             console.log(`❌ API issue for ${from}/${to}`);
+            console.log(response.data);
             return null;
         }
 
-        return Object.keys(data)
-            .slice(0, 5)
-            .map(date => ({
-                date,
-                o: parseFloat(data[date]["1. open"]),
-                h: parseFloat(data[date]["2. high"]),
-                l: parseFloat(data[date]["3. low"]),
-                c: parseFloat(data[date]["4. close"])
-            }));
+        return data.slice(0, 5).map(candle => ({
+            date: candle.datetime,
+            o: parseFloat(candle.open),
+            h: parseFloat(candle.high),
+            l: parseFloat(candle.low),
+            c: parseFloat(candle.close)
+        }));
 
     } catch (e) {
 
@@ -87,7 +89,7 @@ async function getDailyFX(from, to) {
     }
 }
 
-// Analyze Market
+// Analyze Market (UNCHANGED LOGIC)
 async function analyze(candles, pair) {
 
     const today = candles[0];
@@ -97,7 +99,6 @@ async function analyze(candles, pair) {
     let confidence = 0;
     let signal = "NEUTRAL";
 
-    // Trend Detection
     const isUpTrend =
         today.c > yesterday.c &&
         yesterday.c > dayBefore.c;
@@ -106,7 +107,6 @@ async function analyze(candles, pair) {
         today.c < yesterday.c &&
         yesterday.c < dayBefore.c;
 
-    // Pin Bar Detection
     const isBullishPinBar =
         (today.c > today.o) &&
         (today.h - today.c < (today.c - today.l) * 0.5);
@@ -115,7 +115,6 @@ async function analyze(candles, pair) {
         (today.c < today.o) &&
         (today.c - today.l < (today.h - today.c) * 0.5);
 
-    // Signal Logic
     if (isUpTrend) {
 
         signal = "BUY";
@@ -133,7 +132,6 @@ async function analyze(candles, pair) {
             confidence += 20;
     }
 
-    // Trade Setup
     if (signal !== "NEUTRAL") {
 
         const pip =
@@ -162,9 +160,6 @@ async function analyze(candles, pair) {
             TP: tp.toFixed(5)
         });
 
-        /* =========================
-           DUPLICATE CHECK
-        ========================= */
         const signalKey = `${pair}-${signal}-${today.date}`;
 
         if (sentSignals[signalKey]) {
@@ -174,10 +169,9 @@ async function analyze(candles, pair) {
 
         sentSignals[signalKey] = true;
 
-        // Send Telegram Alert
-        await bot.sendMessage(
-            CONFIG.CHAT_ID,
-
+        try {
+            await bot.sendMessage(
+                CONFIG.CHAT_ID,
 `🔥 FOREX SIGNAL
 
 Pair: ${pair}
@@ -188,9 +182,12 @@ Entry: ${entry.toFixed(5)}
 SL: ${sl.toFixed(5)}
 TP: ${tp.toFixed(5)}
 
-Strategy: Swing Trade
+Strategy: Intraday Trend
 Time: ${new Date().toLocaleString()}`
-        );
+            );
+        } catch (err) {
+            console.log("⚠️ Telegram send failed");
+        }
 
     } else {
 
@@ -201,63 +198,63 @@ Time: ${new Date().toLocaleString()}`
 // Main Bot Runner
 async function runBot() {
 
-    /* =========================
-       WEEKEND STOP
-    ========================= */
     if (isWeekend()) {
         console.log("⏸ Weekend detected — market closed. Bot paused.");
         return;
     }
 
+    if (isRunning) {
+        console.log("⚠️ Bot already running. Skipping cycle...");
+        return;
+    }
+
+    isRunning = true;
+
     console.log(`\n==============================`);
     console.log(`🚀 Forex Signal Bot Started`);
     console.log(`==============================`);
 
-    for (const [from, to] of CONFIG.PAIRS) {
+    try {
 
-        const pair = `${from}/${to}`;
+        for (const [from, to] of CONFIG.PAIRS) {
 
-        console.log(`\n🔎 Analyzing ${pair}`);
+            const pair = `${from}/${to}`;
 
-        const candles = await getDailyFX(from, to);
+            console.log(`\n🔎 Analyzing ${pair}`);
 
-        if (candles)
-            await analyze(candles, pair);
+            const candles = await getDailyFX(from, to);
 
-        // Prevent Alpha Vantage rate limit
-        await sleep(15000);
+            if (candles)
+                await analyze(candles, pair);
+
+            await sleep(5000);
+        }
+
+        console.log(`\n✅ Analysis Complete\n`);
+
+    } catch (err) {
+        console.error("❌ RunBot error:", err);
     }
 
-    console.log(`\n✅ Analysis Complete\n`);
+    isRunning = false;
 }
 
+/* =========================
+   ERROR PROTECTION
+========================= */
 process.on('uncaughtException', (err) => {
     console.error('💥 Uncaught Exception:', err);
-
-    console.log('🔁 Restarting bot in 5 seconds...');
-    setTimeout(() => {
-        runBot();
-    }, 5000);
 });
 
 process.on('unhandledRejection', (reason) => {
     console.error('⚠️ Unhandled Promise Rejection:', reason);
-
-    console.log('🔁 Continuing safely...');
 });
 
+// Start system
 async function start() {
-    try {
-        await runBot();
-    } catch (err) {
-        console.error('❌ Bot crashed safely:', err);
-    }
+    await runBot();
 }
 
-// Run immediately
 start();
 
-// Run every 1 hour safely
-setInterval(() => {
-    start();
-}, 60 * 60 * 1000);
+setInterval(start, 15 * 60 * 1000);
