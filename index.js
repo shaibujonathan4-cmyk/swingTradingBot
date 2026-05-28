@@ -1,260 +1,250 @@
 const axios = require('axios');
 const TelegramBot = require('node-telegram-bot-api');
-
 require('dotenv').config();
 const express = require('express');
 
 const app = express();
 
-const PORT = process.env.PORT || 3000;
-
-app.get('/', (req, res) => {
-    res.send('Forex Bot Running...');
-});
-
-app.listen(PORT, () => {
-    console.log(`🌍 Server running on port ${PORT}`);
-});
-
+/* =========================
+   CONFIGURATION
+========================= */
 const CONFIG = {
+    PORT: process.env.PORT || 3000,
     API_KEY: process.env.TWELVE_API_KEY,
     CHAT_ID: process.env.CHAT_ID,
     TELEGRAM_TOKEN: process.env.TELEGRAM_TOKEN,
+    APP_URL: process.env.APP_URL,
 
-    PAIRS: [
-        ["EUR", "USD"],
-        ["GBP", "USD"],
-        ["USD", "JPY"],
-        ["USD", "CHF"]
-    ],
+    PAIRS: [["EUR/USD"], ["GBP/USD"], ["USD/JPY"], ["USD/CHF"]],
 
-    SL_PIPS: 20,
-    TP_PIPS: 60
+    ATR_PERIOD: 14,
+    RISK_MULTIPLIER: 1.0,
+    TP_RATIO: 2.0,
+    STRENGTH_THRESHOLD: 60
+};
+
+const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN, { polling: false });
+
+const state = {
+    sentSignals: new Set(),
+    running: false,
+    lastRun: null
 };
 
 /* =========================
-   SAFETY CONTROLS
+   SERVER
 ========================= */
-const sentSignals = {};
-let isRunning = false;
+app.get('/', (req, res) => res.send('System Online'));
+app.get('/health', (req, res) => res.json({
+    status: "healthy",
+    uptime: process.uptime(),
+    lastRun: state.lastRun
+}));
 
-// Initialize Telegram Bot
-const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN);
+app.listen(CONFIG.PORT, () =>
+    console.log(`🚀 Running on port ${CONFIG.PORT}`)
+);
 
-// Sleep function to avoid API limits
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+/* =========================
+   UTILITIES
+========================= */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/* =========================
+   KEEP ALIVE
+========================= */
+async function keepAlive() {
+    if (!CONFIG.APP_URL) return;
+    try {
+        await axios.get(`${CONFIG.APP_URL}/health`, { timeout: 5000 });
+    } catch (e) {
+        console.log("📡 Keep-alive failed");
+    }
 }
 
 /* =========================
-   WEEKEND CHECK
+   DATA FETCH (WITH RETRY)
 ========================= */
-function isWeekend() {
-    const day = new Date().getDay();
-    return (day === 0 || day === 6);
-}
+async function fetchMarketData(symbol, interval, size = 30, retry = 2) {
+    const url = `https://api.twelvedata.com/time_series?symbol=${symbol}&interval=${interval}&outputsize=${size}&apikey=${CONFIG.API_KEY}`;
 
-// Fetch Forex Data (Twelve Data)
-async function getDailyFX(from, to) {
+    for (let i = 0; i < retry; i++) {
+        try {
+            const res = await axios.get(url, { timeout: 12000 });
 
-    const url =
-        `https://api.twelvedata.com/time_series?symbol=${from}/${to}&interval=15min&outputsize=5&apikey=${CONFIG.API_KEY}`;
+            if (!res.data.values) {
+                throw new Error(res.data.message || "No data");
+            }
 
-    try {
+            return res.data.values.map(c => ({
+                o: +c.open,
+                h: +c.high,
+                l: +c.low,
+                c: +c.close,
+                t: c.datetime
+            }));
 
-        const response = await axios.get(url, {
-            timeout: 15000
-        });
-
-        const data = response.data.values;
-
-        if (!data || response.data.status === "error") {
-            console.log(`❌ API issue for ${from}/${to}`);
-            console.log(response.data);
-            return null;
+        } catch (e) {
+            if (i === retry - 1) {
+                console.log(`❌ Final fail: ${symbol}`);
+                return null;
+            }
+            await sleep(2000);
         }
-
-        return data.slice(0, 5).map(candle => ({
-            date: candle.datetime,
-            o: parseFloat(candle.open),
-            h: parseFloat(candle.high),
-            l: parseFloat(candle.low),
-            c: parseFloat(candle.close)
-        }));
-
-    } catch (e) {
-
-        console.log(`❌ Connection failed for ${from}/${to}`);
-        return null;
     }
 }
 
-// Analyze Market (UNCHANGED LOGIC)
-async function analyze(candles, pair) {
+/* =========================
+   INDICATORS
+========================= */
+function getTrendScore(data, lookback = 6) {
+    let score = 0;
+    for (let i = 0; i < lookback; i++) {
+        if (!data[i + 1]) break;
+        if (data[i].c > data[i + 1].c) score += 15;
+        if (data[i].c < data[i + 1].c) score -= 15;
+    }
+    return score;
+}
 
-    const today = candles[0];
-    const yesterday = candles[1];
-    const dayBefore = candles[2];
+function calculateATR(data, period = 14) {
+    let tr = [];
+    for (let i = 0; i < period && i + 1 < data.length; i++) {
+        const high = data[i].h;
+        const low = data[i].l;
+        const prevClose = data[i + 1].c;
 
-    let confidence = 0;
+        tr.push(Math.max(
+            high - low,
+            Math.abs(high - prevClose),
+            Math.abs(low - prevClose)
+        ));
+    }
+    return tr.reduce((a, b) => a + b, 0) / period;
+}
+
+/* =========================
+   ANALYSIS ENGINE
+========================= */
+async function processPair(pair) {
+
+    const h4 = await fetchMarketData(pair, '4h', 20);
+    const m15 = await fetchMarketData(pair, '15min', 40);
+
+    if (!h4 || !m15) return;
+
+    const biasScore = getTrendScore(h4);
+    const bias =
+        biasScore > 30 ? "BUY" :
+        biasScore < -30 ? "SELL" : "NEUTRAL";
+
+    if (bias === "NEUTRAL") return;
+
+    const m15Score = Math.abs(getTrendScore(m15));
+    if (m15Score < CONFIG.STRENGTH_THRESHOLD) return;
+
+    const last = m15[1];
+    const prev = m15[2];
+
+    const range = last.h - last.l;
+    const body = Math.abs(last.c - last.o);
+    const lowerWick = Math.min(last.c, last.o) - last.l;
+    const upperWick = last.h - Math.max(last.c, last.o);
+
+    const bullPin = lowerWick > range * 0.6 && body < range * 0.25;
+    const bearPin = upperWick > range * 0.6 && body < range * 0.25;
+
     let signal = "NEUTRAL";
 
-    const isUpTrend =
-        today.c > yesterday.c &&
-        yesterday.c > dayBefore.c;
+    if (bias === "BUY" && (last.c > prev.c || bullPin)) signal = "BUY";
+    if (bias === "SELL" && (last.c < prev.c || bearPin)) signal = "SELL";
 
-    const isDownTrend =
-        today.c < yesterday.c &&
-        yesterday.c < dayBefore.c;
+    if (signal === "NEUTRAL") return;
 
-    const isBullishPinBar =
-        (today.c > today.o) &&
-        (today.h - today.c < (today.c - today.l) * 0.5);
+    const atr = calculateATR(m15, CONFIG.ATR_PERIOD);
+    const entry = last.c;
 
-    const isBearishPinBar =
-        (today.c < today.o) &&
-        (today.c - today.l < (today.h - today.c) * 0.5);
+    const sl = signal === "BUY"
+        ? entry - atr * CONFIG.RISK_MULTIPLIER
+        : entry + atr * CONFIG.RISK_MULTIPLIER;
 
-    if (isUpTrend) {
+    const tp = signal === "BUY"
+        ? entry + atr * CONFIG.TP_RATIO
+        : entry - atr * CONFIG.TP_RATIO;
 
-        signal = "BUY";
-        confidence = 60;
+    const id = `${pair}-${signal}-${last.t}`;
+    if (state.sentSignals.has(id)) return;
 
-        if (isBullishPinBar)
-            confidence += 20;
+    state.sentSignals.add(id);
 
-    } else if (isDownTrend) {
-
-        signal = "SELL";
-        confidence = 60;
-
-        if (isBearishPinBar)
-            confidence += 20;
-    }
-
-    if (signal !== "NEUTRAL") {
-
-        const pip =
-            pair.includes("JPY")
-                ? 0.01
-                : 0.0001;
-
-        const entry = today.c;
-
-        const sl =
-            signal === "BUY"
-                ? entry - (CONFIG.SL_PIPS * pip)
-                : entry + (CONFIG.SL_PIPS * pip);
-
-        const tp =
-            signal === "BUY"
-                ? entry + (CONFIG.TP_PIPS * pip)
-                : entry - (CONFIG.TP_PIPS * pip);
-
-        console.log(`\n🔥 ${pair} => ${signal}`);
-
-        console.table({
-            Confidence: `${confidence}%`,
-            Entry: entry.toFixed(5),
-            SL: sl.toFixed(5),
-            TP: tp.toFixed(5)
-        });
-
-        const signalKey = `${pair}-${signal}-${today.date}`;
-
-        if (sentSignals[signalKey]) {
-            console.log(`🔁 Duplicate signal skipped for ${pair}`);
-            return;
-        }
-
-        sentSignals[signalKey] = true;
-
-        try {
-            await bot.sendMessage(
-                CONFIG.CHAT_ID,
-`🔥 FOREX SIGNAL
+    await bot.sendMessage(CONFIG.CHAT_ID,
+`🔥 SIGNAL
 
 Pair: ${pair}
-Direction: ${signal}
-Confidence: ${confidence}%
+Bias: ${bias}
+Signal: ${signal}
 
 Entry: ${entry.toFixed(5)}
 SL: ${sl.toFixed(5)}
 TP: ${tp.toFixed(5)}
 
-Strategy: Intraday Trend
-Time: ${new Date().toLocaleString()}`
-            );
-        } catch (err) {
-            console.log("⚠️ Telegram send failed");
-        }
+Time: ${last.t}`
+    );
 
-    } else {
-
-        console.log(`😴 ${pair} => No clear setup`);
-    }
-}
-
-// Main Bot Runner
-async function runBot() {
-
-    if (isWeekend()) {
-        console.log("⏸ Weekend detected — market closed. Bot paused.");
-        return;
-    }
-
-    if (isRunning) {
-        console.log("⚠️ Bot already running. Skipping cycle...");
-        return;
-    }
-
-    isRunning = true;
-
-    console.log(`\n==============================`);
-    console.log(`🚀 Forex Signal Bot Started`);
-    console.log(`==============================`);
-
-    try {
-
-        for (const [from, to] of CONFIG.PAIRS) {
-
-            const pair = `${from}/${to}`;
-
-            console.log(`\n🔎 Analyzing ${pair}`);
-
-            const candles = await getDailyFX(from, to);
-
-            if (candles)
-                await analyze(candles, pair);
-
-            await sleep(5000);
-        }
-
-        console.log(`\n✅ Analysis Complete\n`);
-
-    } catch (err) {
-        console.error("❌ RunBot error:", err);
-    }
-
-    isRunning = false;
+    console.log(`✅ Signal sent: ${pair}`);
 }
 
 /* =========================
-   ERROR PROTECTION
+   HEARTBEAT (IMPORTANT)
 ========================= */
-process.on('uncaughtException', (err) => {
-    console.error('💥 Uncaught Exception:', err);
-});
+async function heartbeat() {
+    try {
+        await bot.sendMessage(CONFIG.CHAT_ID,
+`💓 BOT HEARTBEAT
 
-process.on('unhandledRejection', (reason) => {
-    console.error('⚠️ Unhandled Promise Rejection:', reason);
-});
-
-// Start system
-async function start() {
-    await runBot();
+Status: ACTIVE
+Time: ${new Date().toLocaleString()}
+Last Run: ${state.lastRun || "Never"}`
+        );
+    } catch (e) {}
 }
 
-start();
+/* =========================
+   RUNNER
+========================= */
+async function runCycle() {
 
-setInterval(start, 15 * 60 * 1000);
+    if (state.running) return;
+    state.running = true;
+
+    const day = new Date().getDay();
+    if (day === 0 || day === 6) {
+        state.running = false;
+        return;
+    }
+
+    state.lastRun = new Date().toLocaleString();
+
+    for (const [pair] of CONFIG.PAIRS) {
+        await processPair(pair);
+        await sleep(7000);
+    }
+
+    console.log("✅ Cycle complete");
+    state.running = false;
+}
+
+/* =========================
+   SAFETY
+========================= */
+process.on('uncaughtException', console.error);
+process.on('unhandledRejection', console.error);
+
+/* =========================
+   START SYSTEM
+========================= */
+setInterval(runCycle, 5 * 60 * 1000);
+setInterval(keepAlive, 4 * 60 * 1000);
+setInterval(heartbeat, 60 * 60 * 1000); // 💓 every hour
+
+runCycle();
