@@ -1,234 +1,373 @@
-const axios = require('axios');
-const TelegramBot = require('node-telegram-bot-api');
-require('dotenv').config();
-const express = require('express');
+require("dotenv").config(); 
+const axios = require("axios");
+const TelegramBot = require("node-telegram-bot-api");
+const express = require("express");
+const fs = require("fs");
 
 const app = express();
 
 /* =========================
-   CONFIGURATION
+CONFIG
 ========================= */
+const ENV = (typeof process !== "undefined" && process && process.env) ? process.env : {};
+
 const CONFIG = {
-    PORT: process.env.PORT || 3000,
-    API_KEY: process.env.TWELVE_API_KEY,
-    CHAT_ID: process.env.CHAT_ID,
-    TELEGRAM_TOKEN: process.env.TELEGRAM_TOKEN,
-    APP_URL: process.env.APP_URL, // Your Render/Heroku URL
-
-    PAIRS: [
-        ["EUR/USD"],
-        ["GBP/USD"],
-        ["USD/JPY"],
-        ["USD/CHF"]
-    ],
-
+    PORT: ENV.PORT || 3000,
+    API_KEY: ENV.TWELVE_API_KEY,
+    TELEGRAM_TOKEN: ENV.TELEGRAM_TOKEN,
+    CHAT_ID: ENV.CHAT_ID,
+    APP_URL: ENV.APP_URL,
+    PAIRS: ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF"],
+    TIMEFRAME: "1h",
+    LOOKBACK: 150,
+    MAX_WAIT_CANDLES: 5,
     ATR_PERIOD: 14,
-    RISK_MULTIPLIER: 1.5, // Recommended: 1.5 - 2.0 for better breathing room
-    TP_RATIO: 2.0,        // 1:2 Risk/Reward
-    STRENGTH_THRESHOLD: 60
+    MIN_RR: 1.5
 };
 
 /* =========================
-   TELEGRAM BOT
+STATE + METRICS (FIXED SAFETY)
 ========================= */
-const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN, { polling: false });
+const STATE_FILE = "./state.json";
 
-/* =========================
-   GLOBAL STATE
-========================= */
-const state = {
-    sentSignals: new Set(),
-    running: false,
-    lastRun: null
+const metrics = {
+    cycles: 0,
+    setupsDetected: 0,
+    setupsInvalidated: 0,
+    signalsSent: 0,
+    errors: 0
 };
 
-/* =========================
-   SERVER (HEALTH CHECK)
-========================= */
-app.get('/', (req, res) => res.send('Forex Bot Engine Online'));
-app.get('/health', (req, res) => {
-    res.json({
-        status: "healthy",
-        uptime: Math.floor(process.uptime()) + "s",
-        lastRun: state.lastRun
-    });
-});
+function loadState() {
+    if (!fs.existsSync(STATE_FILE)) {
+        return { activeSetup: {}, sentSignals: [] };
+    }
 
-app.listen(CONFIG.PORT, () => {
-    console.log(`🚀 Running on port ${CONFIG.PORT}`);
-});
-
-/* =========================
-   UTILITIES
-========================= */
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-/* =========================
-   KEEP ALIVE (ANTI-SLEEP)
-========================= */
-async function keepAlive() {
-    if (!CONFIG.APP_URL) return;
     try {
-        await axios.get(`${CONFIG.APP_URL}/health`, { timeout: 5000 });
-        console.log("💓 Keep-alive ping success");
+        const raw = fs.readFileSync(STATE_FILE, "utf-8");
+        if (!raw) return { activeSetup: {}, sentSignals: [] };
+
+        const data = JSON.parse(raw);
+
+        return {
+            activeSetup: data.activeSetup || {},
+            sentSignals: Array.isArray(data.sentSignals) ? data.sentSignals : []
+        };
+
     } catch (e) {
-        console.log("📡 Keep-alive failed: Platform may be sleeping");
+        return { activeSetup: {}, sentSignals: [] };
     }
 }
 
+const state = loadState();
+state.sentSignals = new Set(state.sentSignals);
+
+function saveState() {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({
+        activeSetup: state.activeSetup,
+        sentSignals: [...state.sentSignals]
+    }, null, 2));
+}
+
 /* =========================
-   FETCH MARKET DATA (HARDENED)
+BOT + SERVER
 ========================= */
-async function fetchMarketData(symbol, interval, size = 30, retry = 2) {
-    // CRITICAL: Added &order=DESC to get NEWEST data first
-    const url = `https://api.twelvedata.com/time_series?symbol=${symbol}&interval=${interval}&outputsize=${size}&apikey=${CONFIG.API_KEY}&order=DESC`;
+const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN, { polling: false });
 
-    for (let i = 0; i < retry; i++) {
+app.get("/", (_, res) => res.send("Pro Trading Bot Running"));
+
+app.get("/health", (req, res) => {
+    res.json({
+        status: "healthy",
+        uptime: process.uptime(),
+        activeSetups: Object.keys(state.activeSetup).length,
+        sentSignals: state.sentSignals.size,
+        lastCycle: metrics.cycles
+    });
+});
+
+app.get("/metrics", (req, res) => {
+    res.json(metrics);
+});
+
+app.listen(CONFIG.PORT, () => {
+    console.log(`🚀 Server running on port ${CONFIG.PORT}`);
+});
+
+/* =========================
+UTILS
+========================= */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function keepAlive() {
+    if (!CONFIG.APP_URL) return;
+
+    try {
+        await axios.get(`${CONFIG.APP_URL}/health`, { timeout: 5000 });
+        console.log(`[KEEPALIVE] OK`);
+    } catch (err) {
+        console.log(`[KEEPALIVE] FAILED`);
+    }
+}
+
+async function fetchWithRetry(url, retries = 3) {
+    for (let i = 1; i <= retries; i++) {
         try {
-            const res = await axios.get(url, { timeout: 12000 });
-            if (!res.data.values) throw new Error(res.data.message || "No data");
-
-            return res.data.values.map(c => ({
-                o: +c.open,
-                h: +c.high,
-                l: +c.low,
-                c: +c.close,
-                t: c.datetime
-            }));
-        } catch (e) {
-            if (i === retry - 1) return null;
+            return await axios.get(url, { timeout: 15000 });
+        } catch (err) {
+            console.log(`[RETRY ${i}] Failed`);
+            if (i === retries) throw err;
             await sleep(2000);
         }
     }
 }
 
 /* =========================
-   INDICATORS
+CANDLE HELPERS (MOVED UP = SAFE)
 ========================= */
-function getTrendScore(data, lookback = 6) {
-    let score = 0;
-    for (let i = 0; i < lookback; i++) {
-        if (!data[i + 1]) break;
-        if (data[i].c > data[i + 1].c) score += 15;
-        if (data[i].c < data[i + 1].c) score -= 15;
-    }
-    return score;
-}
+const isBearish = c => c.c < c.o;
+const isBullish = c => c.c > c.o;
 
-function calculateATR(data, period = 14) {
-    let tr = [];
-    for (let i = 0; i < period && i + 1 < data.length; i++) {
-        const h = data[i].h, l = data[i].l, prevC = data[i + 1].c;
-        tr.push(Math.max(h - l, Math.abs(h - prevC), Math.abs(l - prevC)));
+/* =========================
+FIXED EARLY DECLARATION (CRASH FIX)
+========================= */
+function setupStillValid(data, setup) {
+    for (let i = setup.index + 3; i < data.length; i++) {
+        if (setup.direction === "SELL" && data[i].h > setup.level) return false;
+        if (setup.direction === "BUY" && data[i].l < setup.level) return false;
     }
-    return tr.reduce((a, b) => a + b, 0) / period;
+    return true;
 }
 
 /* =========================
-   ANALYSIS ENGINE
+FETCH DATA
 ========================= */
-async function processPair(pair) {
-    const h4 = await fetchMarketData(pair, '4h', 20);
-    const m15 = await fetchMarketData(pair, '15min', 40);
+async function fetchMarketData(symbol) {
+    const url = `https://api.twelvedata.com/time_series?symbol=${symbol}&interval=${CONFIG.TIMEFRAME}&outputsize=${CONFIG.LOOKBACK}&apikey=${CONFIG.API_KEY}`;
 
-    if (!h4 || !m15) return;
+    const res = await fetchWithRetry(url);
 
-    // 1. Check for stale data (Max 30 mins old)
-    const candleTime = new Date(m15[0].t).getTime();
-    if (Date.now() - candleTime > 30 * 60 * 1000) {
-        console.log(`📜 Skipping stale data for ${pair}`);
+    if (!res?.data?.values) return null;
+
+    return res.data.values.map(c => ({
+        o: +c.open,
+        h: +c.high,
+        l: +c.low,
+        c: +c.close,
+        t: c.datetime
+    })).reverse();
+}
+
+function harami(prev, curr) {
+    const prevHigh = Math.max(prev.o, prev.c);
+    const prevLow = Math.min(prev.o, prev.c);
+
+    const currHigh = Math.max(curr.o, curr.c);
+    const currLow = Math.min(curr.o, curr.c);
+
+    return currHigh < prevHigh &&
+           currLow > prevLow;
+}
+
+/* =========================
+PATTERNS
+========================= */
+function pinBar(c, dir) {
+    const body = Math.abs(c.c - c.o);
+    const range = c.h - c.l;
+    if (range === 0) return false;
+
+    if (dir === "SELL") {
+        const upperWick = c.h - Math.max(c.c, c.o);
+        return upperWick > range * 0.6 && body < range * 0.35;
+    }
+
+    if (dir === "BUY") {
+        const lowerWick = Math.min(c.c, c.o) - c.l;
+        return lowerWick > range * 0.6 && body < range * 0.35;
+    }
+
+    return false;
+}
+
+function engulfing(prev, curr, dir) {
+    if (dir === "SELL") {
+        return isBullish(prev) &&
+               isBearish(curr) &&
+               curr.o >= prev.c &&
+               curr.c < prev.o;
+    }
+
+    if (dir === "BUY") {
+        return isBearish(prev) &&
+               isBullish(curr) &&
+               curr.o <= prev.c &&
+               curr.c > prev.o;
+    }
+
+    return false;
+}
+
+/* =========================
+MARKET LOGIC
+========================= */
+function detectSetup(data) {
+    for (let i = data.length - 20; i < data.length - 3; i++) {
+        const c1 = data[i], c2 = data[i + 1], c3 = data[i + 2];
+
+        if (isBearish(c1) && isBearish(c2) && isBearish(c3)) {
+            return { direction: "SELL", level: c1.o, index: i, candles: 0 };
+        }
+
+        if (isBullish(c1) && isBullish(c2) && isBullish(c3)) {
+            return { direction: "BUY", level: c1.o, index: i, candles: 0 };
+        }
+    }
+    return null;
+}
+
+function atr(data, period = CONFIG.ATR_PERIOD) {
+    let tr = [];
+
+    for (let i = 1; i < data.length; i++) {
+        tr.push(Math.max(
+            data[i].h - data[i].l,
+            Math.abs(data[i].h - data[i - 1].c),
+            Math.abs(data[i].l - data[i - 1].c)
+        ));
+    }
+
+    const slice = tr.slice(-period);
+    const sum = slice.reduce((a, b) => a + b, 0);
+
+    return sum / (slice.length || 1);
+}
+
+/* =========================
+PROCESS ENGINE
+========================= */
+async function process(pair) {
+
+    const data = await fetchMarketData(pair);
+    if (!data) return;
+
+    let setup = state.activeSetup[pair];
+
+    if (!setup) {
+        const newSetup = detectSetup(data);
+        if (newSetup) {
+            state.activeSetup[pair] = newSetup;
+            metrics.setupsDetected++;
+            console.log(`[SETUP] ${pair} ${newSetup.direction}`);
+        }
         return;
     }
 
-    // 2. Bias & Strength
-    const biasScore = getTrendScore(h4);
-    const bias = biasScore > 30 ? "BUY" : biasScore < -30 ? "SELL" : "NEUTRAL";
-    const m15Score = Math.abs(getTrendScore(m15));
+    setup.candles++;
 
-    if (bias === "NEUTRAL" || m15Score < CONFIG.STRENGTH_THRESHOLD) return;
+    const last = data[data.length - 1];
+    const prev = data[data.length - 2];
 
-    // 3. Signal Logic (using m15[1] as the last CLOSED candle)
-    const last = m15[1];
-    const prev = m15[2];
-    const range = last.h - last.l;
-    const body = Math.abs(last.c - last.o);
-    const lowerWick = Math.min(last.c, last.o) - last.l;
-    const upperWick = last.h - Math.max(last.c, last.o);
+    if (!setupStillValid(data, setup)) {
+        delete state.activeSetup[pair];
+        metrics.setupsInvalidated++;
+        console.log(`[INVALID] ${pair}`);
+        return;
+    }
 
-    const bullPin = lowerWick > range * 0.6 && body < range * 0.25;
-    const bearPin = upperWick > range * 0.6 && body < range * 0.25;
+    if (setup.candles > CONFIG.MAX_WAIT_CANDLES) {
+        delete state.activeSetup[pair];
+        return;
+    }
 
-    let signal = "NEUTRAL";
-    if (bias === "BUY" && (last.c > prev.c || bullPin)) signal = "BUY";
-    if (bias === "SELL" && (last.c < prev.c || bearPin)) signal = "SELL";
+    const confirm =
+        pinBar(last, setup.direction) ||
+        engulfing(prev, last, setup.direction) ||
+        harami(prev, last);
 
-    if (signal === "NEUTRAL") return;
+    if (!confirm) return;
 
-    // 4. Levels (Risk-Adjusted)
-    const atr = calculateATR(m15, CONFIG.ATR_PERIOD);
+    const currentATR = atr(data);
+    if (!currentATR) return;
+
+    const distance =
+        setup.direction === "SELL"
+            ? setup.level - last.c
+            : last.c - setup.level;
+
+    if (distance > currentATR * 1.5) {
+        delete state.activeSetup[pair];
+        return;
+    }
+
+    const tp = setup.direction === "SELL"
+        ? Math.min(...data.map(d => d.l))
+        : Math.max(...data.map(d => d.h));
+
+    if (!tp) return;
+
     const entry = last.c;
-    const risk = atr * CONFIG.RISK_MULTIPLIER;
-    const sl = signal === "BUY" ? entry - risk : entry + risk;
-    const tp = signal === "BUY" ? entry + (risk * CONFIG.TP_RATIO) : entry - (risk * CONFIG.TP_RATIO);
+    const sl = setup.level;
 
-    // 5. Duplicate Filter
-    const id = `${pair}-${signal}-${last.t}`;
+    const risk = Math.abs(entry - sl);
+    const reward = Math.abs(tp - entry);
+    const rr = reward / (risk || 1);
+
+    if (rr < CONFIG.MIN_RR) return;
+
+    const id = `${pair}-${setup.direction}-${last.t}`;
     if (state.sentSignals.has(id)) return;
-    state.sentSignals.add(id);
 
-    // 6. Time Conversion (Nigeria WAT)
-    const dateObj = new Date(last.t);
-    const nigeriaTime = dateObj.toLocaleTimeString('en-NG', { hour: '2-digit', minute: '2-digit', hour12: true });
+    state.sentSignals.add(id);
+    saveState();
+    metrics.signalsSent++;
 
     try {
         await bot.sendMessage(CONFIG.CHAT_ID,
-`🔥 *PRO SIGNAL*
-━━━━━━━━━━━━━━
-Pair: \`${pair}\`
-Bias: *${bias}*
-Action: *${signal === 'BUY' ? '🚀 BUY' : '📉 SELL'}*
+`📊 PRO 1H SIGNAL
 
-Entry: \`${entry.toFixed(5)}\`
-SL: \`${sl.toFixed(5)}\`
-TP: \`${tp.toFixed(5)}\`
-RRR: 1:${CONFIG.TP_RATIO}
-━━━━━━━━━━━━━━
-Chart Time: ${last.t}
-Nigeria Time: ${nigeriaTime}`, { parse_mode: "Markdown" });
-        console.log(`✅ Signal sent: ${pair}`);
-    } catch (e) {
-        console.log("❌ Telegram failed");
+Pair: ${pair}
+Direction: ${setup.direction}
+
+Entry: ${entry.toFixed(5)}
+SL: ${sl.toFixed(5)}
+TP: ${tp.toFixed(5)}
+RR: 1:${rr.toFixed(2)}`);
+
+        console.log(`[SIGNAL] ${pair} ${setup.direction}`);
+        delete state.activeSetup[pair];
+        saveState();
+
+    } catch (err) {
+        metrics.errors++;
     }
 }
 
 /* =========================
-   SYSTEM RUNNERS
+RUNNER
 ========================= */
 async function runCycle() {
-    if (state.running || [0, 6].includes(new Date().getDay())) return;
-    state.running = true;
-    state.lastRun = new Date().toLocaleString('en-NG');
+    metrics.cycles++;
+    console.log(`\n[RUN] Cycle ${metrics.cycles}`);
 
-    console.log(`\n🚀 ANALYSIS CYCLE: ${state.lastRun}`);
-
-    for (const [pair] of CONFIG.PAIRS) {
-        await processPair(pair);
-        await sleep(7000); // Rate limit safety
+    for (const pair of CONFIG.PAIRS) {
+        await process(pair);
+        await sleep(2000);
     }
-    state.running = false;
 }
 
 async function heartbeat() {
     try {
-        await bot.sendMessage(CONFIG.CHAT_ID, `💓 *BOT HEARTBEAT*\nStatus: ACTIVE\nLast Run: ${state.lastRun || "Initializing..."}`, { parse_mode: "Markdown" });
+        await bot.sendMessage(CONFIG.CHAT_ID,
+            `💓 HEARTBEAT\nCycles: ${metrics.cycles}\nSignals: ${metrics.signalsSent}`);
     } catch (e) {}
 }
 
 /* =========================
-   START
+START
 ========================= */
-process.on('uncaughtException', console.error);
-process.on('unhandledRejection', console.error);
+process.on("uncaughtException", err => console.log(err));
+process.on("unhandledRejection", err => console.log(err));
 
 setInterval(runCycle, 5 * 60 * 1000);
 setInterval(keepAlive, 4 * 60 * 1000);
