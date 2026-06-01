@@ -40,7 +40,6 @@ function loadState() {
 
 const state = loadState();
 state.sentSignals = new Set(state.sentSignals || []);
-let lastSignalTime = null;
 
 function saveState() {
     fs.writeFileSync(
@@ -57,7 +56,15 @@ const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN, { polling: false });
 app.get("/", (_, res) => res.send("ICT Engine Operational"));
 app.get("/health", (_, res) => res.json({ status: "ok", uptime: process.uptime() }));
 
-app.listen(CONFIG.PORT, () => console.log(`🚀 Running on port ${CONFIG.PORT}`));
+app.listen(CONFIG.PORT, () => {
+    console.log(`🚀 Running on port ${CONFIG.PORT}`);
+    sendStartupMessage();
+});
+
+/* =========================
+TRACKING
+========================= */
+let lastSignalTime = null;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -77,13 +84,13 @@ async function fetchMarketData(symbol, interval, size = 50) {
             c: +c.close,
             t: c.datetime
         }));
-    } catch (e) {
+    } catch {
         return null;
     }
 }
 
 /* =========================
-ICT STRUCTURAL MODULES
+ICT STRUCTURE
 ========================= */
 function getRecentStructure(h4) {
     const highs = h4.slice(1, 25).map(c => c.h);
@@ -98,7 +105,7 @@ function detectSweeps(ltf, structure) {
     for (let i = 1; i <= 6; i++) {
         if (!ltf[i]) break;
         const c = ltf[i];
-        
+
         if (c.h > structure.high && c.c < structure.high) {
             return { swept: true, type: "SELL", index: i, extreme: c.h };
         }
@@ -106,31 +113,29 @@ function detectSweeps(ltf, structure) {
             return { swept: true, type: "BUY", index: i, extreme: c.l };
         }
     }
-    return { swept: false, type: null, index: -1, extreme: null };
+    return { swept: false };
 }
 
 function detectMSS(ltf, direction, sweepIndex) {
-    if (sweepIndex <= 1) return false; 
-    
+    if (sweepIndex <= 1) return false;
+
     for (let i = sweepIndex - 1; i >= 1; i--) {
         const current = ltf[i];
         const prev = ltf[i + 1];
-        
+
         if (direction === "BUY" && current.c > prev.h && current.c > current.o) return true;
         if (direction === "SELL" && current.c < prev.l && current.c < current.o) return true;
     }
     return false;
 }
 
-// FIXED: True forward-chronological scan starting from the sweep candle forward to the present
 function findChronologicalFVG(ltf, bias, sweepExtreme, sweepIndex) {
     if (sweepIndex <= 2) return null;
 
-    // Start scanning at the oldest candle immediately following the sweep, then walk forward toward index 3
     for (let i = sweepIndex - 1; i >= 3; i--) {
-        const c3 = ltf[i];     // Oldest Reference Candle in sequence
-        const c2 = ltf[i - 1]; // Core Displacement Candle
-        const c1 = ltf[i - 2]; // Newest Target Validation Candle
+        const c3 = ltf[i];
+        const c2 = ltf[i - 1];
+        const c1 = ltf[i - 2];
 
         if (bias === "BUY" && c1.l > c3.h && c2.c > c2.o) {
             return { type: "BULLISH", entry: c3.h, invalidation: sweepExtreme };
@@ -148,85 +153,130 @@ PROCESS ENGINE
 ========================= */
 async function processPair(pair) {
     const h4 = await fetchMarketData(pair, "4h", CONFIG.HTF_LOOKBACK);
-    await sleep(2500); 
+    await sleep(2500);
     const ltf = await fetchMarketData(pair, "15min", CONFIG.LTF_LOOKBACK);
 
     if (!h4 || !ltf || ltf.length < 8) return;
 
     const structure = getRecentStructure(h4);
 
-    // 1. Liquidity Sweep Phase
     const sweep = detectSweeps(ltf, structure);
     if (!sweep.swept) return;
 
-    // 2. Market Structure Shift Phase
     if (!detectMSS(ltf, sweep.type, sweep.index)) return;
 
-    // 3. Fair Value Gap Phase
     const fvg = findChronologicalFVG(ltf, sweep.type, sweep.extreme, sweep.index);
     if (!fvg) return;
 
-    // Execution Target Calculations
     let entry = fvg.entry;
-    let sl = fvg.invalidation; 
+    let sl = fvg.invalidation;
     let tp = sweep.type === "BUY" ? structure.high : structure.low;
 
     const risk = Math.abs(entry - sl);
     const reward = Math.abs(tp - entry);
     if (risk === 0 || (reward / risk) < CONFIG.MIN_RR) return;
 
-    // Unique Signal Deduplicator
     const id = `${pair}-${sweep.type}-${ltf[1].t}`;
     if (state.sentSignals.has(id)) return;
 
     state.sentSignals.add(id);
     saveState();
+
     lastSignalTime = new Date();
 
-    const dateObj = new Date(ltf[1].t);
-    const time = dateObj.toLocaleTimeString("en-NG", {
+    const time = new Date(ltf[1].t).toLocaleTimeString("en-NG", {
         hour: "2-digit",
         minute: "2-digit",
         hour12: true
     });
 
-    try {
-        await bot.sendMessage(CONFIG.CHAT_ID,
-`🏛 **ICT STRUCTURAL SIGNAL**
+    await bot.sendMessage(
+        CONFIG.CHAT_ID,
+`🏛 ICT STRUCTURAL SIGNAL
 ━━━━━━━━━━━━━━━━━
-**Pair**: \`${pair}\`
-**Setup Matrix**: *${sweep.type === "BUY" ? "🚀 DISCOUNT LIQUIDITY SWEEP (SSL)" : "📉 PREMIUM LIQUIDITY SWEEP (BSL)"}*
+Pair: ${pair}
+Type: ${sweep.type}
 
-🎯 **Entry Limit (FVG)**: \`${entry.toFixed(5)}\`
-🛑 **Stop (Sweep Extreme)**: \`${sl.toFixed(5)}\`
-🏁 **Target (Draw on Liq)**: \`${tp.toFixed(5)}\`
-📊 **Risk/Reward Ratio**: \`1:${(reward / risk).toFixed(2)}\`
-━━━━━━━━━━━━━━━━━
-🕒 *Trigger Time: ${time} (WAT)*`, { parse_mode: "Markdown" });
-        console.log(`✅ Signal Dispatched: ${pair}`);
-    } catch (e) {
-        console.error("❌ Telegram Dispatch Error:", e.message);
+Entry: ${entry.toFixed(5)}
+SL: ${sl.toFixed(5)}
+TP: ${tp.toFixed(5)}
+RR: 1:${(reward / risk).toFixed(2)}
+
+Time: ${time}`
+    );
+
+    console.log(`Signal sent: ${pair}`);
+}
+
+/* =========================
+RUNNER
+========================= */
+async function runCycle() {
+    console.log(`Cycle: ${new Date().toLocaleString("en-NG")}`);
+
+    for (const pair of CONFIG.PAIRS) {
+        try {
+            await processPair(pair);
+        } catch (e) {
+            console.error("Pair error:", e.message);
+        }
+        await sleep(4000);
     }
 }
 
 /* =========================
-RUNNER SYSTEM
+HEARTBEAT SYSTEM
 ========================= */
-async function runCycle() {
-    console.log(`\n🔄 Execution Cycle Started: ${new Date().toLocaleString('en-NG')}`);
-    for (const pair of CONFIG.PAIRS) {
-        try {
-            await processPair(pair);
-        } catch (err) {
-            console.error(`Error processing ${pair}:`, err.message);
-        }
-        await sleep(4000); 
+async function sendHeartbeat() {
+    try {
+        console.log("Sending heartbeat...");
+
+        const uptimeHours = (process.uptime() / 3600).toFixed(1);
+
+        await bot.sendMessage(
+            CONFIG.CHAT_ID,
+`💚 ICT BOT STATUS
+━━━━━━━━━━━━━━━━━
+Status: ONLINE
+Pairs: ${CONFIG.PAIRS.length}
+Uptime: ${uptimeHours}h
+
+Last Signal:
+${lastSignalTime ? lastSignalTime.toLocaleString("en-NG") : "No signal yet"}`
+        );
+
+        console.log("Heartbeat sent");
+    } catch (e) {
+        console.error("Heartbeat error:", e.message);
     }
 }
 
+/* =========================
+STARTUP MESSAGE
+========================= */
+async function sendStartupMessage() {
+    try {
+        await bot.sendMessage(
+            CONFIG.CHAT_ID,
+`🚀 ICT ENGINE STARTED
+Status: Online
+Pairs: ${CONFIG.PAIRS.length}
+Time: ${new Date().toLocaleString("en-NG")}`
+        );
+    } catch (e) {
+        console.error("Startup error:", e.message);
+    }
+}
+
+/* =========================
+LOOPS
+========================= */
 process.on("uncaughtException", console.error);
 process.on("unhandledRejection", console.error);
 
 setInterval(runCycle, 5 * 60 * 1000);
-runCycle();
 setInterval(sendHeartbeat, 60 * 60 * 1000);
+
+/* IMPORTANT: run immediately */
+runCycle();
+sendHeartbeat();
