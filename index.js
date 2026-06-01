@@ -14,51 +14,50 @@ const CONFIG = {
     API_KEY: process.env.TWELVE_API_KEY,
     CHAT_ID: process.env.CHAT_ID,
     TELEGRAM_TOKEN: process.env.TELEGRAM_TOKEN,
-    APP_URL: process.env.APP_URL,
 
     PAIRS: ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF"],
 
     HTF_LOOKBACK: 50,
     LTF_LOOKBACK: 40,
-
     MIN_RR: 1.5
 };
 
 /* =========================
-STATE MANAGEMENT
+STATE
 ========================= */
 const STATE_FILE = "./state.json";
 
 function loadState() {
-    if (!fs.existsSync(STATE_FILE)) return { sentSignals: [] };
     try {
-        return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
+        if (!fs.existsSync(STATE_FILE)) return { sent: [] };
+        return JSON.parse(fs.readFileSync(STATE_FILE));
     } catch {
-        return { sentSignals: [] };
+        return { sent: [] };
     }
 }
 
 const state = loadState();
-state.sentSignals = new Set(state.sentSignals || []);
-
-function saveState() {
-    fs.writeFileSync(
-        STATE_FILE,
-        JSON.stringify({ sentSignals: [...state.sentSignals] }, null, 2)
-    );
-}
+state.sent = new Set(state.sent);
 
 /* =========================
-BOT + SERVER
+BOT
 ========================= */
 const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN, { polling: false });
 
-app.get("/", (_, res) => res.send("ICT Engine Operational"));
-app.get("/health", (_, res) => res.json({ status: "ok", uptime: process.uptime() }));
+/* =========================
+SERVER (KEEP ALIVE FOR RENDER)
+========================= */
+app.get("/", (_, res) => res.send("ICT Bot Running"));
+app.get("/health", (_, res) => {
+    res.json({
+        status: "ok",
+        uptime: process.uptime()
+    });
+});
 
 app.listen(CONFIG.PORT, () => {
-    console.log(`🚀 Running on port ${CONFIG.PORT}`);
-    sendStartupMessage();
+    console.log(`Server running on port ${CONFIG.PORT}`);
+    startup();
 });
 
 /* =========================
@@ -66,15 +65,20 @@ TRACKING
 ========================= */
 let lastSignalTime = null;
 
+/* =========================
+UTILS
+========================= */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 /* =========================
 DATA FETCH
 ========================= */
-async function fetchMarketData(symbol, interval, size = 50) {
+async function getData(symbol, interval, size = 50) {
     const url = `https://api.twelvedata.com/time_series?symbol=${symbol}&interval=${interval}&outputsize=${size}&apikey=${CONFIG.API_KEY}&order=DESC`;
+
     try {
         const res = await axios.get(url, { timeout: 12000 });
+
         if (!res.data.values) return null;
 
         return res.data.values.map(c => ({
@@ -90,159 +94,150 @@ async function fetchMarketData(symbol, interval, size = 50) {
 }
 
 /* =========================
-ICT STRUCTURE
+STRUCTURE
 ========================= */
-function getRecentStructure(h4) {
+function structure(h4) {
     const highs = h4.slice(1, 25).map(c => c.h);
     const lows = h4.slice(1, 25).map(c => c.l);
+
     return {
         high: Math.max(...highs),
         low: Math.min(...lows)
     };
 }
 
-function detectSweeps(ltf, structure) {
+function sweep(ltf, st) {
     for (let i = 1; i <= 6; i++) {
-        if (!ltf[i]) break;
         const c = ltf[i];
+        if (!c) break;
 
-        if (c.h > structure.high && c.c < structure.high) {
-            return { swept: true, type: "SELL", index: i, extreme: c.h };
+        if (c.h > st.high && c.c < st.high) {
+            return { ok: true, type: "SELL", idx: i, extreme: c.h };
         }
-        if (c.l < structure.low && c.c > structure.low) {
-            return { swept: true, type: "BUY", index: i, extreme: c.l };
+
+        if (c.l < st.low && c.c > st.low) {
+            return { ok: true, type: "BUY", idx: i, extreme: c.l };
         }
     }
-    return { swept: false };
+
+    return { ok: false };
 }
 
-function detectMSS(ltf, direction, sweepIndex) {
-    if (sweepIndex <= 1) return false;
+function mss(ltf, dir, idx) {
+    if (idx <= 1) return false;
 
-    for (let i = sweepIndex - 1; i >= 1; i--) {
-        const current = ltf[i];
-        const prev = ltf[i + 1];
+    for (let i = idx - 1; i >= 1; i--) {
+        const c = ltf[i];
+        const p = ltf[i + 1];
 
-        if (direction === "BUY" && current.c > prev.h && current.c > current.o) return true;
-        if (direction === "SELL" && current.c < prev.l && current.c < current.o) return true;
+        if (dir === "BUY" && c.c > p.h) return true;
+        if (dir === "SELL" && c.c < p.l) return true;
     }
+
     return false;
 }
 
-function findChronologicalFVG(ltf, bias, sweepExtreme, sweepIndex) {
-    if (sweepIndex <= 2) return null;
+function fvg(ltf, dir, extreme, idx) {
+    if (idx <= 2) return null;
 
-    for (let i = sweepIndex - 1; i >= 3; i--) {
+    for (let i = idx - 1; i >= 3; i--) {
         const c3 = ltf[i];
         const c2 = ltf[i - 1];
         const c1 = ltf[i - 2];
 
-        if (bias === "BUY" && c1.l > c3.h && c2.c > c2.o) {
-            return { type: "BULLISH", entry: c3.h, invalidation: sweepExtreme };
+        if (dir === "BUY" && c1.l > c3.h) {
+            return { entry: c3.h, sl: extreme, type: "BUY" };
         }
 
-        if (bias === "SELL" && c1.h < c3.l && c2.c < c2.o) {
-            return { type: "BEARISH", entry: c3.l, invalidation: sweepExtreme };
+        if (dir === "SELL" && c1.h < c3.l) {
+            return { entry: c3.l, sl: extreme, type: "SELL" };
         }
     }
+
     return null;
 }
 
 /* =========================
-PROCESS ENGINE
+PROCESS
 ========================= */
-async function processPair(pair) {
-    const h4 = await fetchMarketData(pair, "4h", CONFIG.HTF_LOOKBACK);
-    await sleep(2500);
-    const ltf = await fetchMarketData(pair, "15min", CONFIG.LTF_LOOKBACK);
+async function process(pair) {
+    const h4 = await getData(pair, "4h", CONFIG.HTF_LOOKBACK);
+    await sleep(2000);
+    const ltf = await getData(pair, "15min", CONFIG.LTF_LOOKBACK);
 
-    if (!h4 || !ltf || ltf.length < 8) return;
+    if (!h4 || !ltf) return;
 
-    const structure = getRecentStructure(h4);
+    const st = structure(h4);
+    const sw = sweep(ltf, st);
 
-    const sweep = detectSweeps(ltf, structure);
-    if (!sweep.swept) return;
+    if (!sw.ok) return;
+    if (!mss(ltf, sw.type, sw.idx)) return;
 
-    if (!detectMSS(ltf, sweep.type, sweep.index)) return;
+    const trade = fvg(ltf, sw.type, sw.extreme, sw.idx);
+    if (!trade) return;
 
-    const fvg = findChronologicalFVG(ltf, sweep.type, sweep.extreme, sweep.index);
-    if (!fvg) return;
+    const tp = sw.type === "BUY" ? st.high : st.low;
 
-    let entry = fvg.entry;
-    let sl = fvg.invalidation;
-    let tp = sweep.type === "BUY" ? structure.high : structure.low;
+    const risk = Math.abs(trade.entry - trade.sl);
+    const reward = Math.abs(tp - trade.entry);
 
-    const risk = Math.abs(entry - sl);
-    const reward = Math.abs(tp - entry);
-    if (risk === 0 || (reward / risk) < CONFIG.MIN_RR) return;
+    if (risk === 0 || reward / risk < CONFIG.MIN_RR) return;
 
-    const id = `${pair}-${sweep.type}-${ltf[1].t}`;
-    if (state.sentSignals.has(id)) return;
+    const id = `${pair}-${sw.type}-${ltf[1].t}`;
+    if (state.sent.has(id)) return;
 
-    state.sentSignals.add(id);
-    saveState();
+    state.sent.add(id);
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ sent: [...state.sent] }, null, 2));
 
     lastSignalTime = new Date();
 
-    const time = new Date(ltf[1].t).toLocaleTimeString("en-NG", {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: true
-    });
-
     await bot.sendMessage(
         CONFIG.CHAT_ID,
-`🏛 ICT STRUCTURAL SIGNAL
-━━━━━━━━━━━━━━━━━
+`🏛 ICT SIGNAL
 Pair: ${pair}
-Type: ${sweep.type}
+Type: ${sw.type}
 
-Entry: ${entry.toFixed(5)}
-SL: ${sl.toFixed(5)}
+Entry: ${trade.entry.toFixed(5)}
+SL: ${trade.sl.toFixed(5)}
 TP: ${tp.toFixed(5)}
-RR: 1:${(reward / risk).toFixed(2)}
-
-Time: ${time}`
+RR: 1:${(reward / risk).toFixed(2)}`
     );
 
-    console.log(`Signal sent: ${pair}`);
+    console.log("Signal:", pair);
 }
 
 /* =========================
-RUNNER
+RUNNER LOOP
 ========================= */
-async function runCycle() {
-    console.log(`Cycle: ${new Date().toLocaleString("en-NG")}`);
+async function cycle() {
+    console.log("Cycle:", new Date().toLocaleString());
 
-    for (const pair of CONFIG.PAIRS) {
+    for (const p of CONFIG.PAIRS) {
         try {
-            await processPair(pair);
+            await process(p);
         } catch (e) {
-            console.error("Pair error:", e.message);
+            console.error("Error:", e.message);
         }
-        await sleep(4000);
+        await sleep(3000);
     }
 }
 
 /* =========================
-HEARTBEAT SYSTEM
+HEARTBEAT (RELIABLE)
 ========================= */
-async function sendHeartbeat() {
+async function heartbeat() {
     try {
-        console.log("Sending heartbeat...");
-
-        const uptimeHours = (process.uptime() / 3600).toFixed(1);
+        const uptime = (process.uptime() / 3600).toFixed(2);
 
         await bot.sendMessage(
             CONFIG.CHAT_ID,
-`💚 ICT BOT STATUS
-━━━━━━━━━━━━━━━━━
+`💚 BOT STATUS
 Status: ONLINE
 Pairs: ${CONFIG.PAIRS.length}
-Uptime: ${uptimeHours}h
+Uptime: ${uptime}h
 
 Last Signal:
-${lastSignalTime ? lastSignalTime.toLocaleString("en-NG") : "No signal yet"}`
+${lastSignalTime ? lastSignalTime.toLocaleString() : "None"}`
         );
 
         console.log("Heartbeat sent");
@@ -252,16 +247,15 @@ ${lastSignalTime ? lastSignalTime.toLocaleString("en-NG") : "No signal yet"}`
 }
 
 /* =========================
-STARTUP MESSAGE
+STARTUP
 ========================= */
-async function sendStartupMessage() {
+async function startup() {
     try {
         await bot.sendMessage(
             CONFIG.CHAT_ID,
-`🚀 ICT ENGINE STARTED
-Status: Online
+`🚀 BOT STARTED
 Pairs: ${CONFIG.PAIRS.length}
-Time: ${new Date().toLocaleString("en-NG")}`
+Time: ${new Date().toLocaleString()}`
         );
     } catch (e) {
         console.error("Startup error:", e.message);
@@ -269,14 +263,27 @@ Time: ${new Date().toLocaleString("en-NG")}`
 }
 
 /* =========================
-LOOPS
+SAFE LOOPS (NO INTERVAL RELIANCE ONLY)
+========================= */
+async function loopRunner() {
+    while (true) {
+        await cycle();
+        await sleep(5 * 60 * 1000);
+    }
+}
+
+async function heartbeatRunner() {
+    while (true) {
+        await heartbeat();
+        await sleep(60 * 60 * 1000);
+    }
+}
+
+/* =========================
+START SYSTEM
 ========================= */
 process.on("uncaughtException", console.error);
 process.on("unhandledRejection", console.error);
 
-setInterval(runCycle, 5 * 60 * 1000);
-setInterval(sendHeartbeat, 60 * 60 * 1000);
-
-/* IMPORTANT: run immediately */
-runCycle();
-sendHeartbeat();
+loopRunner();
+heartbeatRunner();
