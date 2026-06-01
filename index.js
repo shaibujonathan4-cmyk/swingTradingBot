@@ -40,6 +40,7 @@ function loadState() {
 
 const state = loadState();
 state.sentSignals = new Set(state.sentSignals || []);
+let lastSignalTime = null;
 
 function saveState() {
     fs.writeFileSync(
@@ -180,6 +181,7 @@ async function processPair(pair) {
 
     state.sentSignals.add(id);
     saveState();
+    lastSignalTime = new Date();
 
     const dateObj = new Date(ltf[1].t);
     const time = dateObj.toLocaleTimeString("en-NG", {
