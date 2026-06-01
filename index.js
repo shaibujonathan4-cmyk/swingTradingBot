@@ -225,5 +225,6 @@ async function runCycle() {
 process.on("uncaughtException", console.error);
 process.on("unhandledRejection", console.error);
 
-setInterval(runCycle, 60* 60 * 1000);
+setInterval(runCycle, 5 * 60 * 1000);
 runCycle();
+setInterval(sendHeartbeat, 60 * 60 * 1000);
