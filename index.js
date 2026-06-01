@@ -160,7 +160,7 @@ function fvg(ltf, dir, extreme, idx) {
 /* =========================
 PROCESS
 ========================= */
-async function process(pair) {
+async function processPair(pair) {
     const h4 = await getData(pair, "4h", CONFIG.HTF_LOOKBACK);
     await sleep(2000);
     const ltf = await getData(pair, "15min", CONFIG.LTF_LOOKBACK);
@@ -214,7 +214,7 @@ async function cycle() {
 
     for (const p of CONFIG.PAIRS) {
         try {
-            await process(p);
+            await processPair(p);
         } catch (e) {
             console.error("Error:", e.message);
         }
