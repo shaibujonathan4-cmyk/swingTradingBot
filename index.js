@@ -1,289 +1,330 @@
-require("dotenv").config();
+// ==========================================
+// LIQUIDITY BREAK & RETEST BOT v5 (PRODUCTION)
+// ==========================================
+
 const axios = require("axios");
-const TelegramBot = require("node-telegram-bot-api");
 const express = require("express");
-const fs = require("fs");
+require("dotenv").config();
 
-const app = express();
-
-/* =========================
-CONFIG
-========================= */
+// ==========================================
+// CONFIG
+// ==========================================
 const CONFIG = {
-    PORT: process.env.PORT || 3000,
-    API_KEY: process.env.TWELVE_API_KEY,
-    CHAT_ID: process.env.CHAT_ID,
-    TELEGRAM_TOKEN: process.env.TELEGRAM_TOKEN,
+    BASE_URL: "https://api.twelvedata.com/time_series",
+    API_KEY: process.env.TWELVE_DATA_API_KEY || "YOUR_KEY",
+    SYMBOL: "EUR/USD",
 
-    PAIRS: ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF"],
+    TELEGRAM: {
+        TOKEN: process.env.TELEGRAM_TOKEN,
+        CHAT_ID: process.env.CHAT_ID
+    },
 
-    HTF_LOOKBACK: 50,
-    LTF_LOOKBACK: 40,
-    MIN_RR: 1.5
+    RULES: {
+        "EUR/USD": {
+            sessions: [{ start: 6, end: 9 }, { start: 12, end: 16 }],
+            minRR: 3,
+            atrMultSL: 1.5,
+            zoneBufferATR: 0.2
+        }
+    },
+
+    LTF_INTERVAL: 15000 // IMPORTANT: reduced to avoid API limit
 };
 
-/* =========================
-STATE
-========================= */
-const STATE_FILE = "./state.json";
+// ==========================================
+// STATE
+// ==========================================
+let STATE = {
+    d1Bias: "NONE",
+    atr: 0,
+    h4Resistance: 0,
+    h4Support: 0,
+    lastRun: 0
+};
 
-function loadState() {
+// ==========================================
+// EXPRESS KEEP ALIVE (RENDER)
+// ==========================================
+const app = express();
+
+app.get("/", (req, res) => {
+    res.send("🚀 Liquidity Bot Running");
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Keep-alive server running"));
+
+// ==========================================
+// TELEGRAM SENDER
+// ==========================================
+async function sendTelegram(message) {
+    if (!CONFIG.TELEGRAM.TOKEN || !CONFIG.TELEGRAM.CHAT_ID) return;
+
+    const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM.TOKEN}/sendMessage`;
+
     try {
-        if (!fs.existsSync(STATE_FILE)) return { sent: [] };
-        return JSON.parse(fs.readFileSync(STATE_FILE));
-    } catch {
-        return { sent: [] };
+        await axios.post(url, {
+            chat_id: CONFIG.TELEGRAM.CHAT_ID,
+            text: message,
+            parse_mode: "HTML"
+        });
+    } catch (err) {
+        console.error("[TELEGRAM ERROR]", err.message);
     }
 }
 
-const state = loadState();
-state.sent = new Set(state.sent);
-
-/* =========================
-BOT
-========================= */
-const bot = new TelegramBot(CONFIG.TELEGRAM_TOKEN, { polling: false });
-
-/* =========================
-SERVER (KEEP ALIVE FOR RENDER)
-========================= */
-app.get("/", (_, res) => res.send("ICT Bot Running"));
-app.get("/health", (_, res) => {
-    res.json({
-        status: "ok",
-        uptime: process.uptime()
-    });
-});
-
-app.listen(CONFIG.PORT, () => {
-    console.log(`Server running on port ${CONFIG.PORT}`);
-    startup();
-});
-
-/* =========================
-TRACKING
-========================= */
-let lastSignalTime = null;
-
-/* =========================
-UTILS
-========================= */
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-/* =========================
-DATA FETCH
-========================= */
-async function getData(symbol, interval, size = 50) {
-    const url = `https://api.twelvedata.com/time_series?symbol=${symbol}&interval=${interval}&outputsize=${size}&apikey=${CONFIG.API_KEY}&order=DESC`;
+// ==========================================
+// DATA FETCH
+// ==========================================
+async function fetchCandles(tf, size = 50) {
+    const url = `${CONFIG.BASE_URL}?symbol=${CONFIG.SYMBOL}&interval=${tf}&outputsize=${size}&apikey=${CONFIG.API_KEY}`;
 
     try {
-        const res = await axios.get(url, { timeout: 12000 });
+        const res = await axios.get(url);
+        if (!res.data?.values) return null;
 
-        if (!res.data.values) return null;
-
-        return res.data.values.map(c => ({
+        return res.data.values.reverse().map(c => ({
             o: +c.open,
             h: +c.high,
             l: +c.low,
-            c: +c.close,
-            t: c.datetime
+            c: +c.close
         }));
     } catch {
         return null;
     }
 }
 
-/* =========================
-STRUCTURE
-========================= */
-function structure(h4) {
-    const highs = h4.slice(1, 25).map(c => c.h);
-    const lows = h4.slice(1, 25).map(c => c.l);
+// ==========================================
+// ATR
+// ==========================================
+function ATR(candles, period = 14) {
+    const trs = [];
 
-    return {
-        high: Math.max(...highs),
-        low: Math.min(...lows)
-    };
+    for (let i = 1; i < candles.length; i++) {
+        trs.push(Math.max(
+            candles[i].h - candles[i].l,
+            Math.abs(candles[i].h - candles[i - 1].c),
+            Math.abs(candles[i].l - candles[i - 1].c)
+        ));
+    }
+
+    return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
 }
 
-function sweep(ltf, st) {
-    for (let i = 1; i <= 6; i++) {
-        const c = ltf[i];
-        if (!c) break;
+// ==========================================
+// LIQUIDITY ENGINE
+// ==========================================
+class LiquidityZoneEngine {
 
-        if (c.h > st.high && c.c < st.high) {
-            return { ok: true, type: "SELL", idx: i, extreme: c.h };
+    getSwings(candles, lb = 3) {
+        const highs = [];
+        const lows = [];
+
+        for (let i = lb; i < candles.length - lb; i++) {
+            const c = candles[i];
+
+            const isHigh = candles.slice(i - lb, i + lb + 1)
+                .every(x => c.h >= x.h);
+
+            const isLow = candles.slice(i - lb, i + lb + 1)
+                .every(x => c.l <= x.l);
+
+            if (isHigh) highs.push(c.h);
+            if (isLow) lows.push(c.l);
         }
 
-        if (c.l < st.low && c.c > st.low) {
-            return { ok: true, type: "BUY", idx: i, extreme: c.l };
+        return { highs, lows };
+    }
+
+    getStrongZones(candles, atr) {
+        const { highs, lows } = this.getSwings(candles);
+
+        const tolerance = atr * 0.25;
+
+        const match = (levels) => {
+            const zones = [];
+
+            for (let i = 0; i < levels.length; i++) {
+                let count = 1;
+
+                for (let j = i + 1; j < levels.length; j++) {
+                    if (Math.abs(levels[i] - levels[j]) <= tolerance) {
+                        count++;
+                    }
+                }
+
+                if (count >= 2) zones.push(levels[i]);
+            }
+
+            return zones;
+        };
+
+        return {
+            highs: match(highs),
+            lows: match(lows)
+        };
+    }
+}
+
+// ==========================================
+// STRATEGY ENGINE (CANDLE CLOSE ONLY LOGIC)
+// ==========================================
+class BreakRetestEngine {
+
+    constructor() {
+        this.state = {
+            sweep: null,
+            breakoutLevel: 0,
+            direction: "NONE",
+            armed: false
+        };
+    }
+
+    bull(c) {
+        return c.c > c.o;
+    }
+
+    bear(c) {
+        return c.c < c.o;
+    }
+
+    detectSweep(c, level) {
+        if (c.h > level && c.c < level) return "HIGH";
+        if (c.l < level && c.c > level) return "LOW";
+        return "NONE";
+    }
+
+    onClose(candle, context) {
+
+        const buffer = context.atr * 0.2;
+
+        // 1. SWEEP
+        if (!this.state.sweep) {
+            const highSweep = this.detectSweep(candle, context.liquidityHigh);
+            const lowSweep = this.detectSweep(candle, context.liquidityLow);
+
+            if (highSweep !== "NONE") {
+                this.state.sweep = "HIGH";
+                this.state.breakoutLevel = context.liquidityHigh;
+            }
+
+            if (lowSweep !== "NONE") {
+                this.state.sweep = "LOW";
+                this.state.breakoutLevel = context.liquidityLow;
+            }
+
+            return null;
         }
-    }
 
-    return { ok: false };
-}
+        // 2. ARMING
+        if (!this.state.armed) {
+            if (this.state.sweep === "HIGH" && candle.c < this.state.breakoutLevel) {
+                this.state.armed = true;
+                this.state.direction = "BEARISH";
+            }
 
-function mss(ltf, dir, idx) {
-    if (idx <= 1) return false;
+            if (this.state.sweep === "LOW" && candle.c > this.state.breakoutLevel) {
+                this.state.armed = true;
+                this.state.direction = "BULLISH";
+            }
 
-    for (let i = idx - 1; i >= 1; i--) {
-        const c = ltf[i];
-        const p = ltf[i + 1];
-
-        if (dir === "BUY" && c.c > p.h) return true;
-        if (dir === "SELL" && c.c < p.l) return true;
-    }
-
-    return false;
-}
-
-function fvg(ltf, dir, extreme, idx) {
-    if (idx <= 2) return null;
-
-    for (let i = idx - 1; i >= 3; i--) {
-        const c3 = ltf[i];
-        const c2 = ltf[i - 1];
-        const c1 = ltf[i - 2];
-
-        if (dir === "BUY" && c1.l > c3.h) {
-            return { entry: c3.h, sl: extreme, type: "BUY" };
+            return null;
         }
 
-        if (dir === "SELL" && c1.h < c3.l) {
-            return { entry: c3.l, sl: extreme, type: "SELL" };
-        }
+        // 3. RETEST ZONE (ONLY CLOSED CANDLES)
+        const inZone =
+            candle.l <= this.state.breakoutLevel + buffer &&
+            candle.h >= this.state.breakoutLevel - buffer;
+
+        if (!inZone) return null;
+
+        // 4. CONFIRMATION (CLOSE ONLY)
+        const valid =
+            (this.state.direction === "BULLISH" && this.bull(candle)) ||
+            (this.state.direction === "BEARISH" && this.bear(candle));
+
+        if (!valid) return null;
+
+        const signal = {
+            direction: this.state.direction,
+            entry: candle.c,
+            level: this.state.breakoutLevel,
+            time: new Date().toISOString()
+        };
+
+        this.reset();
+        return signal;
     }
 
-    return null;
-}
-
-/* =========================
-PROCESS
-========================= */
-async function processPair(pair) {
-    const h4 = await getData(pair, "4h", CONFIG.HTF_LOOKBACK);
-    await sleep(2000);
-    const ltf = await getData(pair, "15min", CONFIG.LTF_LOOKBACK);
-
-    if (!h4 || !ltf) return;
-
-    const st = structure(h4);
-    const sw = sweep(ltf, st);
-
-    if (!sw.ok) return;
-    if (!mss(ltf, sw.type, sw.idx)) return;
-
-    const trade = fvg(ltf, sw.type, sw.extreme, sw.idx);
-    if (!trade) return;
-
-    const tp = sw.type === "BUY" ? st.high : st.low;
-
-    const risk = Math.abs(trade.entry - trade.sl);
-    const reward = Math.abs(tp - trade.entry);
-
-    if (risk === 0 || reward / risk < CONFIG.MIN_RR) return;
-
-    const id = `${pair}-${sw.type}-${ltf[1].t}`;
-    if (state.sent.has(id)) return;
-
-    state.sent.add(id);
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ sent: [...state.sent] }, null, 2));
-
-    lastSignalTime = new Date();
-
-    await bot.sendMessage(
-        CONFIG.CHAT_ID,
-`🏛 ICT SIGNAL
-Pair: ${pair}
-Type: ${sw.type}
-
-Entry: ${trade.entry.toFixed(5)}
-SL: ${trade.sl.toFixed(5)}
-TP: ${tp.toFixed(5)}
-RR: 1:${(reward / risk).toFixed(2)}`
-    );
-
-    console.log("Signal:", pair);
-}
-
-/* =========================
-RUNNER LOOP
-========================= */
-async function cycle() {
-    console.log("Cycle:", new Date().toLocaleString());
-
-    for (const p of CONFIG.PAIRS) {
-        try {
-            await processPair(p);
-        } catch (e) {
-            console.error("Error:", e.message);
-        }
-        await sleep(3000);
+    reset() {
+        this.state = {
+            sweep: null,
+            breakoutLevel: 0,
+            direction: "NONE",
+            armed: false
+        };
     }
 }
 
-/* =========================
-HEARTBEAT (RELIABLE)
-========================= */
-async function heartbeat() {
-    try {
-        const uptime = (process.uptime() / 3600).toFixed(2);
+// ==========================================
+// INIT
+// ==========================================
+const liquidityEngine = new LiquidityZoneEngine();
+const strategy = new BreakRetestEngine();
 
-        await bot.sendMessage(
-            CONFIG.CHAT_ID,
-`💚 BOT STATUS
-Status: ONLINE
-Pairs: ${CONFIG.PAIRS.length}
-Uptime: ${uptime}h
+// ==========================================
+// MAIN LOOP (SAFE FOR API LIMITS)
+// ==========================================
+async function run() {
 
-Last Signal:
-${lastSignalTime ? lastSignalTime.toLocaleString() : "None"}`
-        );
+    const now = Date.now();
+    if (now - STATE.lastRun < CONFIG.LTF_INTERVAL) return;
+    STATE.lastRun = now;
 
-        console.log("Heartbeat sent");
-    } catch (e) {
-        console.error("Heartbeat error:", e.message);
+    const h4 = await fetchCandles("4h", 50);
+    const d1 = await fetchCandles("1day", 30);
+    if (!h4 || !d1) return;
+
+    STATE.atr = ATR(h4);
+
+    const zones = liquidityEngine.getStrongZones(h4, STATE.atr);
+
+    STATE.h4Resistance = zones.highs[zones.highs.length - 1] || Math.max(...h4.map(c => c.h));
+    STATE.h4Support = zones.lows[zones.lows.length - 1] || Math.min(...h4.map(c => c.l));
+
+    STATE.d1Bias = d1[d1.length - 1].c > d1[d1.length - 2].c ? "BULLISH" : "BEARISH";
+
+    const m15 = await fetchCandles("15min", 20);
+    if (!m15) return;
+
+    const last = m15[m15.length - 1];
+
+    const signal = strategy.onClose(last, {
+        atr: STATE.atr,
+        liquidityHigh: STATE.h4Resistance,
+        liquidityLow: STATE.h4Support
+    });
+
+    if (signal) {
+
+        const message = `
+🔥 <b>LIQUIDITY BREAK & RETEST SIGNAL</b>
+
+📊 Pair: ${CONFIG.SYMBOL}
+📈 Direction: ${signal.direction}
+💰 Entry: ${signal.entry}
+📍 Level: ${signal.level}
+⏰ Time: ${signal.time}
+        `;
+
+        console.log(message);
+        await sendTelegram(message);
     }
 }
 
-/* =========================
-STARTUP
-========================= */
-async function startup() {
-    try {
-        await bot.sendMessage(
-            CONFIG.CHAT_ID,
-`🚀 BOT STARTED
-Pairs: ${CONFIG.PAIRS.length}
-Time: ${new Date().toLocaleString()}`
-        );
-    } catch (e) {
-        console.error("Startup error:", e.message);
-    }
-}
+// ==========================================
+// START BOT
+// ==========================================
+setInterval(run, CONFIG.LTF_INTERVAL);
 
-/* =========================
-SAFE LOOPS (NO INTERVAL RELIANCE ONLY)
-========================= */
-async function loopRunner() {
-    while (true) {
-        await cycle();
-        await sleep(5 * 60 * 1000);
-    }
-}
-
-async function heartbeatRunner() {
-    while (true) {
-        await heartbeat();
-        await sleep(60 * 60 * 1000);
-    }
-}
-
-/* =========================
-START SYSTEM
-========================= */
-process.on("uncaughtException", console.error);
-process.on("unhandledRejection", console.error);
-
-loopRunner();
-heartbeatRunner();
+console.log("🚀 Liquidity Break & Retest Bot Running (PRODUCTION READY)");
